@@ -3,49 +3,109 @@
     // Prevent double initialization
     if (window.sparklesAILoaded) {
         console.log('Sparkles AI: Already loaded, skipping initialization');
-        return;
-    }
-    window.sparklesAILoaded = true;
+        // Prevent double injection
+        if (window.sparklesAIInjected) {
+            console.log('Sparkles AI: Already injected, skipping initialization.');
+            return;
+        }
+        window.sparklesAIInjected = true;
 
-    // Global state stored on window to survive re-injection
-    window.sparklesState = window.sparklesState || {
-        recognition: null,
-        isListening: false,
-        currentAIRequest: null,
-        partialTranscript: '',
-        finalTranscriptBuffer: '',
-        silenceTimeout: null,
-        stealthMode: false
-    };
+        let state = {
+            isListening: false,
+            recognition: null,
+            chatHistory: [], // Will load from storage
+            currentAIRequest: null, // { id, loadingEl, fullResponse }
+            transcriptBuffer: '',
+            silenceTimer: null,
+            resumeContext: ''
+        };
 
-    const state = window.sparklesState;
+        // Load history from storage
+        chrome.storage.local.get(['sparklesHistory'], (result) => {
+            if (result.sparklesHistory) {
+                state.chatHistory = result.sparklesHistory;
+                console.log('Sparkles AI: Loaded history:', state.chatHistory.length, 'turns');
+            }
+        });
 
-    function initSparklesAI() {
-        console.log('Sparkles AI: Initializing...');
-
-        // Create overlay if it doesn't exist
-        if (!document.getElementById('sparkles-ai-overlay')) {
-            createOverlay();
+        function saveHistory() {
+            // Limit history to last 50 turns to prevent storage overflow
+            const trimmed = state.chatHistory.slice(-50);
+            chrome.storage.local.set({ sparklesHistory: trimmed });
         }
 
-        // Register message listener
-        registerMessageListener();
+        // Helper to append to history and save
+        function addToHistory(role, text) {
+            state.chatHistory.push({ role, text });
+            saveHistory();
+        }
 
-        // Initialize Web Speech API
-        initSpeechRecognition();
+        // Listen for stream chunks from background
+        chrome.runtime.onMessage.addListener((msg) => {
+            if (msg.type === 'CHAT_STREAM_CHUNK') {
+                if (state.currentAIRequest && state.currentAIRequest.id === msg.requestId) {
+                    if (state.currentAIRequest.loadingEl) {
+                        if (state.currentAIRequest.isFirstChunk) {
+                            state.currentAIRequest.loadingEl.innerHTML = '';
+                            state.currentAIRequest.isFirstChunk = false;
+                        }
+                        state.currentAIRequest.fullResponse += msg.chunk;
+                        state.currentAIRequest.loadingEl.innerHTML = formatMarkdown(state.currentAIRequest.fullResponse);
 
-        // Add global keyboard shortcuts
-        setupKeyboardShortcuts();
+                        const responseArea = document.getElementById('sparkles-response-area');
+                        if (responseArea) responseArea.scrollTop = responseArea.scrollHeight;
+                    }
+                }
+            }
+            if (msg.type === 'CHAT_STREAM_DONE') {
+                if (state.currentAIRequest && state.currentAIRequest.id === msg.requestId) {
+                    updateStatus(state.isListening ? '🎤 Listening...' : 'Ready');
 
-        console.log('Sparkles AI: Ready!');
-    }
+                    // Save context to history
+                    if (state.chatHistory) {
+                        state.chatHistory.push({ role: 'user', text: state.currentAIRequest.query });
+                        state.chatHistory.push({ role: 'AI', text: state.currentAIRequest.fullResponse });
+                        // Limit memory to last 10 exchanges (20 messages)
+                        if (state.chatHistory.length > 20) state.chatHistory = state.chatHistory.slice(-20);
+                    }
+                }
+            }
+            // ... (error handling) ...
+        });
 
-    function createOverlay() {
-        const overlay = document.createElement('div');
-        overlay.id = 'sparkles-ai-overlay';
-        overlay.classList.add('hidden');
+        function initSparklesAI() {
+            console.log('Sparkles AI: Initializing...');
 
-        overlay.innerHTML = `
+            // Create overlay if it doesn't exist
+            if (!document.getElementById('sparkles-ai-overlay')) {
+                createOverlay();
+            }
+
+            // Register message listener
+            registerMessageListener();
+
+            // Initialize Web Speech API
+            initSpeechRecognition();
+
+            // Add global keyboard shortcuts
+            setupKeyboardShortcuts();
+
+            console.log('Sparkles AI: Ready!');
+        }
+
+        function createOverlay() {
+            // CLEANUP: Remove any existing overlay (likely from a previous extension version)
+            const oldOverlay = document.getElementById('sparkles-ai-overlay');
+            if (oldOverlay) {
+                console.log('Sparkles AI: Removing orphaned overlay');
+                oldOverlay.remove();
+            }
+
+            const overlay = document.createElement('div');
+            overlay.id = 'sparkles-ai-overlay';
+            overlay.classList.add('hidden');
+
+            overlay.innerHTML = `
             <div class="sparkles-header">
                 <span class="sparkles-title">✨ Sparkles AI</span>
                 <div class="sparkles-controls">
@@ -73,214 +133,275 @@
             </div>
         `;
 
-        document.body.appendChild(overlay);
-        console.log('Sparkles AI: Overlay created');
+            document.body.appendChild(overlay);
+            console.log('Sparkles AI: Overlay created');
 
-        setupUIEventHandlers();
-    }
-
-    function setupKeyboardShortcuts() {
-        document.addEventListener('keydown', (e) => {
-            // Ctrl+Shift+S - Toggle listening
-            if (e.ctrlKey && e.shiftKey && e.key === 'S') {
-                e.preventDefault();
-                const overlay = document.getElementById('sparkles-ai-overlay');
-                if (overlay && !overlay.classList.contains('hidden')) {
-                    toggleListening();
-                }
-            }
-
-            // Ctrl+Shift+H - Toggle stealth mode
-            if (e.ctrlKey && e.shiftKey && e.key === 'H') {
-                e.preventDefault();
-                toggleStealthMode();
-            }
-
-            // Escape - Hide overlay
-            if (e.key === 'Escape') {
-                const overlay = document.getElementById('sparkles-ai-overlay');
-                if (overlay && !overlay.classList.contains('hidden')) {
-                    stopListening();
-                    overlay.classList.add('hidden');
-                }
-            }
-
-            // Ctrl+Shift+O - Quick open overlay
-            if (e.ctrlKey && e.shiftKey && e.key === 'O') {
-                e.preventDefault();
-                const overlay = document.getElementById('sparkles-ai-overlay');
-                if (overlay) {
-                    overlay.classList.remove('hidden');
-                }
-            }
-        });
-    }
-
-    function toggleStealthMode() {
-        state.stealthMode = !state.stealthMode;
-        const overlay = document.getElementById('sparkles-ai-overlay');
-        const stealthBtn = document.getElementById('sparkles-stealth');
-
-        if (state.stealthMode) {
-            overlay?.classList.add('stealth-mode');
-            if (stealthBtn) stealthBtn.textContent = '🙈';
-            console.log('Sparkles AI: Stealth mode ON');
-        } else {
-            overlay?.classList.remove('stealth-mode');
-            if (stealthBtn) stealthBtn.textContent = '👁';
-            console.log('Sparkles AI: Stealth mode OFF');
-        }
-    }
-
-    function initSpeechRecognition() {
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-
-        if (!SpeechRecognition) {
-            console.error('Sparkles AI: Web Speech API not supported');
-            return;
+            setupUIEventHandlers();
         }
 
-        state.recognition = new SpeechRecognition();
-        state.recognition.continuous = true;
-        state.recognition.interimResults = true;
-        state.recognition.lang = 'en-US';
-
-        state.recognition.onstart = () => {
-            state.isListening = true;
-            updateStatus('🎤 Listening...');
-            document.getElementById('sparkles-mic')?.classList.add('recording');
-        };
-
-        state.recognition.onend = () => {
-            if (state.isListening) {
-                setTimeout(() => {
-                    try {
-                        if (state.isListening && state.recognition) {
-                            state.recognition.start();
-                        }
-                    } catch (e) {
-                        console.log('Sparkles AI: Restart error:', e.message);
+        function setupKeyboardShortcuts() {
+            document.addEventListener('keydown', (e) => {
+                // Ctrl+Shift+S - Toggle listening
+                if (e.ctrlKey && e.shiftKey && e.key === 'S') {
+                    e.preventDefault();
+                    const overlay = document.getElementById('sparkles-ai-overlay');
+                    if (overlay && !overlay.classList.contains('hidden')) {
+                        toggleListening();
                     }
-                }, 100);
-            } else {
-                updateStatus('Ready');
-                document.getElementById('sparkles-mic')?.classList.remove('recording');
-            }
-        };
-
-        state.recognition.onerror = (event) => {
-            console.error('Sparkles AI: Error:', event.error);
-            if (event.error === 'not-allowed') {
-                appendMessage('System', '❌ Mic access denied.');
-                state.isListening = false;
-                updateStatus('Mic Denied');
-            }
-        };
-
-        state.recognition.onresult = (event) => {
-            let interimTranscript = '';
-            let finalTranscript = '';
-
-            for (let i = event.resultIndex; i < event.results.length; i++) {
-                const transcript = event.results[i][0].transcript;
-                if (event.results[i].isFinal) {
-                    finalTranscript += transcript;
-                } else {
-                    interimTranscript += transcript;
                 }
-            }
 
-            // Show live transcript
-            const liveTranscriptEl = document.getElementById('sparkles-live-transcript');
-            if (liveTranscriptEl) {
-                if (interimTranscript || finalTranscript) {
-                    liveTranscriptEl.classList.remove('hidden');
-                    liveTranscriptEl.innerHTML = `
-                        <span class="partial">${interimTranscript}</span>
-                        <span class="final">${finalTranscript}</span>
-                    `;
+                // Ctrl+Shift+H - Toggle stealth mode
+                if (e.ctrlKey && e.shiftKey && e.key === 'H') {
+                    e.preventDefault();
+                    toggleStealthMode();
                 }
-            }
 
-            // Process finalized transcript
-            if (finalTranscript) {
-                state.finalTranscriptBuffer += ' ' + finalTranscript;
-                state.finalTranscriptBuffer = state.finalTranscriptBuffer.trim();
-
-                if (state.silenceTimeout) clearTimeout(state.silenceTimeout);
-
-                // 500ms silence triggers AI (reduced from 600ms for faster response)
-                state.silenceTimeout = setTimeout(() => {
-                    if (state.finalTranscriptBuffer) {
-                        const query = state.finalTranscriptBuffer;
-                        state.finalTranscriptBuffer = '';
-
-                        if (liveTranscriptEl) {
-                            liveTranscriptEl.classList.add('hidden');
-                            liveTranscriptEl.innerHTML = '';
-                        }
-
-                        processQuery(query);
+                // Escape - Hide overlay
+                if (e.key === 'Escape') {
+                    const overlay = document.getElementById('sparkles-ai-overlay');
+                    if (overlay && !overlay.classList.contains('hidden')) {
+                        stopListening();
+                        overlay.classList.add('hidden');
                     }
-                }, 500);
-            }
-        };
-    }
+                }
 
-    async function processQuery(query) {
-        if (!query.trim()) return;
-        if (!isExtensionContextValid()) {
-            showContextInvalidMessage();
-            return;
-        }
-
-        updateStatus('🤔 Thinking...');
-
-        if (state.currentAIRequest) {
-            state.currentAIRequest.aborted = true;
-        }
-
-        const requestId = Date.now();
-        state.currentAIRequest = { id: requestId, aborted: false };
-
-        appendMessage('You', query);
-        const loadingEl = appendMessage('AI', '⏳ ...', true);
-
-        try {
-            const response = await chrome.runtime.sendMessage({
-                type: 'CHAT_REQUEST',
-                query: query,
-                mode: 'full'
+                // Ctrl+Shift+O - Quick open overlay
+                if (e.ctrlKey && e.shiftKey && e.key === 'O') {
+                    e.preventDefault();
+                    const overlay = document.getElementById('sparkles-ai-overlay');
+                    if (overlay) {
+                        overlay.classList.remove('hidden');
+                    }
+                }
             });
+        }
 
-            if (state.currentAIRequest.aborted || state.currentAIRequest.id !== requestId) {
-                loadingEl.innerHTML = '<em>(superseded)</em>';
+        function toggleStealthMode() {
+            state.stealthMode = !state.stealthMode;
+            const overlay = document.getElementById('sparkles-ai-overlay');
+            const stealthBtn = document.getElementById('sparkles-stealth');
+
+            if (state.stealthMode) {
+                overlay?.classList.add('stealth-mode');
+                if (stealthBtn) stealthBtn.textContent = '🙈';
+                console.log('Sparkles AI: Stealth mode ON');
+            } else {
+                overlay?.classList.remove('stealth-mode');
+                if (stealthBtn) stealthBtn.textContent = '👁';
+                console.log('Sparkles AI: Stealth mode OFF');
+            }
+        }
+
+        function initSpeechRecognition() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+            if (!SpeechRecognition) {
+                console.error('Sparkles AI: Web Speech API not supported');
                 return;
             }
 
-            if (response && response.solution) {
-                loadingEl.innerHTML = formatMarkdown(response.solution);
-            } else if (response && response.error) {
-                loadingEl.innerHTML = '❌ ' + response.error;
-            } else {
-                loadingEl.innerHTML = '❌ No response. Backend running?';
+            state.recognition = new SpeechRecognition();
+            state.recognition.continuous = true;
+            state.recognition.interimResults = true;
+            state.recognition.lang = 'en-US';
+
+            state.recognition.onstart = () => {
+                state.isListening = true;
+                updateStatus('🎤 Listening...');
+                document.getElementById('sparkles-mic')?.classList.add('recording');
+            };
+
+            state.recognition.onend = () => {
+                if (state.isListening) {
+                    setTimeout(() => {
+                        try {
+                            if (state.isListening && state.recognition) {
+                                state.recognition.start();
+                            }
+                        } catch (e) {
+                            console.log('Sparkles AI: Restart error:', e.message);
+                        }
+                    }, 100);
+                } else {
+                    updateStatus('Ready');
+                    document.getElementById('sparkles-mic')?.classList.remove('recording');
+                }
+            };
+
+            state.recognition.onerror = (event) => {
+                if (event.error === 'no-speech') {
+                    // Benign error, just ignore (loop will restart in onend)
+                    return;
+                }
+                console.error('Sparkles AI: Error:', event.error);
+                if (event.error === 'not-allowed') {
+                    appendMessage('System', '❌ Mic access denied.');
+                    state.isListening = false;
+                    updateStatus('Mic Denied');
+                }
+            };
+
+            state.recognition.onresult = (event) => {
+                let interimTranscript = '';
+                let finalTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    const transcript = event.results[i][0].transcript;
+                    if (event.results[i].isFinal) {
+                        finalTranscript += transcript;
+                    } else {
+                        interimTranscript += transcript;
+                    }
+                }
+
+                // Show live transcript
+                const liveTranscriptEl = document.getElementById('sparkles-live-transcript');
+                if (liveTranscriptEl) {
+                    if (interimTranscript || finalTranscript) {
+                        liveTranscriptEl.classList.remove('hidden');
+                        liveTranscriptEl.innerHTML = `
+                        <span class="partial">${interimTranscript}</span>
+                        <span class="final">${finalTranscript}</span>
+                    `;
+                    }
+                }
+
+                // Process finalized transcript
+                if (finalTranscript) {
+                    state.finalTranscriptBuffer += ' ' + finalTranscript;
+                    state.finalTranscriptBuffer = state.finalTranscriptBuffer.trim();
+
+                    if (state.silenceTimeout) clearTimeout(state.silenceTimeout);
+
+                    // 500ms silence triggers AI (reduced from 600ms for faster response)
+                    state.silenceTimeout = setTimeout(() => {
+                        if (state.finalTranscriptBuffer) {
+                            const query = state.finalTranscriptBuffer;
+                            state.finalTranscriptBuffer = '';
+
+                            if (liveTranscriptEl) {
+                                liveTranscriptEl.classList.add('hidden');
+                                liveTranscriptEl.innerHTML = '';
+                            }
+
+                            processQuery(query);
+                        }
+                    }, 500);
+                }
+            };
+        }
+
+        // Listen for stream chunks from background
+        chrome.runtime.onMessage.addListener((msg) => {
+            if (msg.type === 'CHAT_STREAM_CHUNK') {
+                if (state.currentAIRequest && state.currentAIRequest.id === msg.requestId) {
+                    if (state.currentAIRequest.loadingEl) {
+                        // Clear "Thinking..." on first chunk
+                        if (state.currentAIRequest.isFirstChunk) {
+                            state.currentAIRequest.loadingEl.innerHTML = '';
+                            state.currentAIRequest.isFirstChunk = false;
+                        }
+                        // Append text (preserving newlines/formatting logic is complex for partial markdown, 
+                        // but for speed we append raw text or formatted if possible. 
+                        // Simple append for now, markdown parsing usually needs full block)
+                        // Ideally we buffer or just append.
+
+                        // For smoother markdown, we just append text content. 
+                        // Full markdown rendering on every chunk is expensive/glitchy.
+                        // We'll append to a buffer and update innerHTML?
+                        state.currentAIRequest.fullResponse += msg.chunk;
+                        state.currentAIRequest.loadingEl.innerHTML = formatMarkdown(state.currentAIRequest.fullResponse);
+
+                        // Scroll to bottom
+                        const responseArea = document.getElementById('sparkles-response-area');
+                        if (responseArea) responseArea.scrollTop = responseArea.scrollHeight;
+                    }
+                }
             }
-        } catch (error) {
-            if (error.message.includes('Extension context invalidated')) {
-                loadingEl.innerHTML = '⚠️ Refresh page to reconnect.';
-            } else {
-                loadingEl.innerHTML = '❌ ' + error.message;
+            if (msg.type === 'CHAT_STREAM_DONE') {
+                if (msg.requestId !== state.currentAIRequest?.id) return;
+
+                // Finalize
+                const finalResponse = state.currentAIRequest.fullResponse;
+                state.currentAIRequest.loadingEl.classList.remove('loading');
+                state.currentAIRequest = null;
+
+                // Add AI response to history
+                addToHistory('AI', finalResponse);
             }
-        } finally {
-            if (state.currentAIRequest && state.currentAIRequest.id === requestId) {
-                updateStatus(state.isListening ? '🎤 Listening...' : 'Ready');
+
+            if (msg.type === 'CHAT_STREAM_ERROR') {
+                if (msg.requestId !== state.currentAIRequest?.id) return;
+
+                state.currentAIRequest.loadingEl.innerHTML += `<br><span style="color:red">Error: ${msg.error}</span>`;
+                state.currentAIRequest.loadingEl.classList.remove('loading');
+                state.currentAIRequest = null;
+            }
+        });
+
+        async function processQuery() {
+            if (state.isProcessing || !state.transcriptBuffer.trim()) return;
+
+            const query = state.transcriptBuffer.trim();
+            state.isProcessing = true;
+            updateStatus('Thinking...');
+
+            // Add User query to history
+            addToHistory('User', query);
+            appendMessage('User', query);
+
+            state.transcriptBuffer = '';
+            const transcriptEl = overlay.querySelector('.sparkles-live-transcript');
+            if (transcriptEl) transcriptEl.innerHTML = '';
+
+            // Create AI Message Placeholder
+            const requestId = Date.now().toString();
+            const loadingEl = appendMessage('AI', '<span class="cursor">|</span>');
+            loadingEl.classList.add('loading');
+
+            state.currentAIRequest = {
+                id: requestId,
+                loadingEl: loadingEl,
+                fullResponse: ''
+            };
+
+            try {
+                // Send request to background (Fire-and-Forget)
+                // We use a callback with void 0 to prevent 'message channel closed' errors.
+                // Chrome interprets passing a callback as "I handled the response", 
+                // even if background returns nothing immediately.
+                chrome.runtime.sendMessage({
+                    type: 'CHAT_REQUEST',
+                    query: query,
+                    mode: 'full',
+                    requestId: requestId,
+                    history: state.chatHistory // Pass full loaded history
+                }, (response) => {
+                    // Ignore any response or errors here, relying on CHAT_STREAM_ERROR event
+                    const err = chrome.runtime.lastError;
+                    if (err) {
+                        console.error("Sparkles AI: Request Error (caught):", err.message);
+                        loadingEl.innerHTML = `<span style="color:red">Error: ${err.message}</span>`;
+                    }
+                });
+
+                // Note: actual content comes via CHAT_STREAM_CHUNK listener
+
+            } catch (error) {
+                console.error('Sparkles AI: Process Error:', error);
+                loadingEl.innerHTML = `<span style="color:red">Connection Failed: ${error.message}</span>`;
+                state.isProcessing = false;
+                updateStatus('Error');
+            } finally {
+                state.isProcessing = false;
+                updateStatus('Ready');
             }
         }
-    }
 
-    function updateStatus(status) {
-        const statusEl = document.getElementById('sparkles-status');
-        if (statusEl) statusEl.textContent = status;
+        function updateStatus(status) {
+            const statusEl = document.getElementById('sparkles-status');
+            if (statusEl) statusEl.textContent = status;
+        }
     }
 
     function startListening() {
@@ -424,12 +545,64 @@
 
     function formatMarkdown(text) {
         if (!text) return '';
-        return text
-            .replace(/```(\w+)?\n?([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
-            .replace(/`([^`]+)`/g, '<code>$1</code>')
-            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-            .replace(/\*(.*?)\*/g, '<em>$1</em>')
-            .replace(/\n/g, '<br>');
+
+        let formatted = text;
+
+        // 1. Split by CLOSED code blocks first
+        const parts = formatted.split(/(```[\s\S]*?```)/g);
+
+        return parts.map((part, index) => {
+            // Case A: Complete Code Block (Safe)
+            if (part.startsWith('```') && part.endsWith('```')) {
+                const codeMatch = part.match(/^```(\w*)\n?([\s\S]*?)```$/);
+                if (codeMatch) {
+                    const lang = codeMatch[1] || '';
+                    const code = codeMatch[2];
+                    return `<div class="code-block">
+                                <div class="code-header">${lang || 'Code'}</div>
+                                <pre><code class="language-${lang}">${code}</code></pre>
+                            </div>`;
+                }
+            }
+
+            // Case B: This is the LAST chunk and might contain an OPEN block
+            if (index === parts.length - 1 && part.includes('```')) {
+                const lastTickIndex = part.lastIndexOf('```');
+                // Check if it's really the start of a block (not just inline code like `foo`)
+                // Heuristic: If it's at the end, treat as block start.
+
+                const textBefore = part.substring(0, lastTickIndex);
+                const potentialBlock = part.substring(lastTickIndex);
+
+                // Render the text before normally
+                const renderedText = textBefore
+                    .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
+                    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                    .replace(/\*(.*?)\*/g, '<em>$1</em>');
+
+                // Render the rest as an OPEN code block
+                const openMatch = potentialBlock.match(/^```(\w*)\n?([\s\S]*)$/);
+                if (openMatch) {
+                    const lang = openMatch[1] || '';
+                    const code = openMatch[2];
+                    return renderedText + `<div class="code-block">
+                                <div class="code-header">${lang || 'Code'}</div>
+                                <pre><code class="language-${lang}">${code}</code></pre>
+                            </div>`;
+                }
+                // If match failed (e.g. just "```"), still render box
+                return renderedText + `<div class="code-block">
+                            <div class="code-header">...</div>
+                            <pre><code></code></pre>
+                        </div>`;
+            }
+
+            // Case C: Regular Text
+            return part
+                .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.*?)\*/g, '<em>$1</em>');
+        }).join('');
     }
 
     function makeDraggable(overlay) {

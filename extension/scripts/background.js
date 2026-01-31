@@ -9,27 +9,77 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (request.type === 'CHAT_REQUEST') {
         // Handle chat request from content script
-        fetch(`${BACKEND_URL}/chat`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                query: request.query,
-                mode: request.mode || 'full'
-            })
-        })
-            .then(response => response.json())
-            .then(data => {
-                console.log('Background: Chat response received');
-                sendResponse(data);
-            })
-            .catch(error => {
-                console.error('Background: Chat error:', error);
-                sendResponse({ error: error.message });
-            });
 
-        return true; // Keep message channel open for async response
+        // 1. Send immediate response to close the request channel
+        // behavior: synchronous response
+        sendResponse({ streamStarted: true });
+
+        // 2. Perform async work safely
+        (async () => {
+            try {
+                const response = await fetch(`${BACKEND_URL}/chat`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        query: request.query,
+                        mode: request.mode || 'full',
+                        stream: true, // Enable streaming
+                        history: request.history || [] // Pass context
+                    })
+                });
+
+                if (!response.ok) throw new Error(response.statusText);
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+
+                // Stream processing...
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    const chunk = decoder.decode(value, { stream: true });
+                    // Send chunk to active tab
+                    if (sender.tab?.id) {
+                        try {
+                            chrome.tabs.sendMessage(sender.tab.id, {
+                                type: 'CHAT_STREAM_CHUNK',
+                                requestId: request.requestId, // Ensure we match the request
+                                chunk: chunk
+                            });
+                        } catch (e) {
+                            // Tab might be closed
+                            break;
+                        }
+                    }
+                }
+
+                // Send end message
+                if (sender.tab?.id) {
+                    chrome.tabs.sendMessage(sender.tab.id, {
+                        type: 'CHAT_STREAM_DONE',
+                        requestId: request.requestId
+                    });
+                }
+
+            } catch (error) {
+                console.error('Background: Chat error:', error);
+
+                // Note: We cannot use sendResponse here anymore because we already closed it.
+                // We use tabs.sendMessage instead.
+
+                if (sender.tab?.id) {
+                    chrome.tabs.sendMessage(sender.tab.id, {
+                        type: 'CHAT_STREAM_ERROR',
+                        requestId: request.requestId,
+                        error: error.message
+                    });
+                }
+            }
+        })();
+
+        return false; // Explicitly close the message channel (Synchronous)
     }
 
     if (request.type === 'TOGGLE_FROM_POPUP') {
@@ -140,3 +190,44 @@ async function toggleOverlay() {
         console.error('Background: Error in toggleOverlay:', error);
     }
 }
+// Direct Launch: Toggle overlay when icon is clicked (no popup)
+chrome.action.onClicked.addListener((tab) => {
+    console.log('Background: Icon clicked, toggling overlay');
+    toggleOverlay();
+});
+
+// AUTO-RECOVERY: Inject content scripts on install/update to avoid "Extension context invalidated"
+chrome.runtime.onInstalled.addListener(async () => {
+    console.log('Sparkles AI: Extension installed/updated. Injecting scripts...');
+
+    try {
+        const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
+
+        for (const tab of tabs) {
+            // Skip restricted pages
+            if (tab.url.startsWith('chrome://') ||
+                tab.url.startsWith('chrome-extension://') ||
+                tab.url.startsWith('edge://')) continue;
+
+            console.log(`Sparkles AI: Re-injecting into tab ${tab.id} (${tab.title})`);
+
+            try {
+                // Determine if we should inject styles and scripts
+                await chrome.scripting.executeScript({
+                    target: { tabId: tab.id },
+                    files: ['scripts/content.js']
+                });
+
+                await chrome.scripting.insertCSS({
+                    target: { tabId: tab.id },
+                    files: ['styles/overlay.css']
+                });
+            } catch (err) {
+                // Some tabs might be restricted or closed
+                console.log(`Sparkles AI: Could not inject into ${tab.id}:`, err.message);
+            }
+        }
+    } catch (e) {
+        console.error('Sparkles AI: Auto-injection failed:', e);
+    }
+});

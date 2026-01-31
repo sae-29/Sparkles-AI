@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Sparkles AI - Real-Time Interview Practice Companion",
-  "version": "1.0",
-  "description": "Your AI interview coach that stays on top.",
+  "name": "Sparkles AI",
+  "version": "1.1",
+  "description": "Seamless AI Interview Assistant",
   "permissions": [
     "activeTab",
     "scripting",
@@ -13,7 +13,6 @@
     "http://localhost:3000/*"
   ],
   "action": {
-    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
